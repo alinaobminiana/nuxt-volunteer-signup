@@ -7,7 +7,7 @@
     "node": ">=24.0.0"
   },
   "scripts": {
-    "dev": "nuxt dev --host 127.0.0.1",
+    "dev": "nuxt dev --host localhost",
     "build": "nuxt build",
     "start": "node --env-file-if-exists=.env .output/server/index.mjs",
     "test": "node --test test/*.test.mjs",

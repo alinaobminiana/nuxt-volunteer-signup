@@ -3,7 +3,7 @@ import { z } from 'zod';
 import config from './config.js';
 import { openStore } from './store.js';
 import { sendMail } from './mail.js';
-import { AppError, baseUrl, rateLimit } from './security.js';
+import { AppError, rateLimit } from './security.js';
 
 const fieldSchema = field => {
   if (field.type === 'checkbox') return z.enum(['on','true'], {error:`${field.label} is required.`});
@@ -15,36 +15,24 @@ const fieldSchema = field => {
   return value;
 };
 export const submissionSchema=z.object(Object.fromEntries(config.fields.map(f=>[f.name,fieldSchema(f)])));
-export const jsonSchema={type:'object',required:config.fields.map(f=>f.name),properties:Object.fromEntries(config.fields.map(f=>[f.name,{type:'string',minLength:1,maxLength:f.type==='textarea'?2000:300,...(f.options?{enum:f.options.map(o=>o.value)}:{})}]))};
 
 export function createService({store=openStore(), deliver=sendMail}={}) {
-  const {db,records,get,find,insert,update,atomic,token,inspectToken,consume,queue}=store;
-  const owner=()=>process.env.OWNER_EMAIL || 'owner@example.com';
-  const link=raw=>`${baseUrl()}/access/${raw}`;
-  const notify=(row,key,to,subject,text,replyTo)=>queue(`${row.id}:${key}`,{to:Array.isArray(to)?to:[to],subject,text,category:`${config.kind}.${key.split('-')[0]}`,customVariables:{record_id:row.id,workflow:config.kind},headers:{'X-Workflow-Reference':row.id},...(replyTo?{replyTo}:{})});
-  const duplicate=(key,message='This request has already been recorded.')=>{if(find(key))throw new AppError(message,409)};
-  const requirePending=(id,status='pending')=>{const row=get(id);if(!row || row.kind!==config.kind)throw new AppError('Record not found.',404);if(row.status!==status)throw new AppError('This record has already been updated.',409);return row};
+  const {db,records,find,insert,atomic,queue}=store;
+  const notify=(row,key,to,subject,text)=>queue(`${row.id}:${key}`,{to:[to],subject,text,category:`${config.kind}.${key}`,customVariables:{record_id:row.id,workflow:config.kind},headers:{'X-Workflow-Reference':row.id}});
   const instructions={welcome:'Arrive at the main entrance at 09:00. We will show you the sign-in desk.',setup:'Meet at the loading entrance at 08:00. Wear comfortable shoes.',cleanup:'Meet by the stage at 17:00. Supplies will be provided.'};
-const onSubmit=data=>{duplicate(data.email,'This email is already on the volunteer list.');const row=insert(config.kind,data,'registered',data.email);notify(row,'signup',data.email,'Your Community Day volunteer details',`Hello ${data.name},\nThank you for joining the ${data.role} team.\n${instructions[data.role]}\nYour availability: ${data.availability}`);return row};
-const publicView=()=>({count:records(config.kind).length,rows:[]});
-  const adminExtra=()=>({});
-  const onAction=()=>{throw new AppError('Unknown operator action.',400)};
-  const accessDescription=()=>'';
-  const onRedeem=()=>{throw new AppError('Unknown link action.',400)};
-  let flushing=false;
-  async function flush() {
-    if(flushing)return; flushing=true;
+const onSubmit=data=>{if(find(data.email))return {};const row=insert(config.kind,data,'registered',data.email);notify(row,'signup',data.email,'Your Community Day volunteer details',`Hello ${data.name},\nThank you for joining the ${data.role} team.\n${instructions[data.role]}\nYour availability: ${data.availability}`);return row};
+  let flushing=null;
+  function flush() {
+    return flushing ||= run().finally(()=>{flushing=null});
+  }
+  async function run() {
     const save=(id,result)=>db.prepare('UPDATE outbox SET status=?,provider_id=?,error=? WHERE id=?').run(result.status,result.providerId || '',result.error || null,id);
-    try {
-      while(true) {
+    while(true) {
         const candidates=db.prepare("SELECT * FROM outbox WHERE status='pending' ORDER BY created_at LIMIT 20").all();
         if(!candidates.length)break;
         const claimed=[];
         for(const row of candidates) {
           const message=JSON.parse(row.payload);
-          if(message.subscriberId && get(message.subscriberId)?.status!=='confirmed') {
-            db.prepare("UPDATE outbox SET status='cancelled' WHERE id=? AND status='pending'").run(row.id);continue;
-          }
           if(db.prepare("UPDATE outbox SET status='sending' WHERE id=? AND status='pending'").run(row.id).changes)claimed.push({...row,message});
         }
         for(const row of claimed) {
@@ -52,7 +40,6 @@ const publicView=()=>({count:records(config.kind).length,rows:[]});
           catch(error){save(row.id,{status:error.uncertain?'unknown':'failed',error:error.message || 'Sending failed.'});}
         }
       }
-    } finally {flushing=false;}
   }
   async function submit(input, identity='local') {
     const parsed=submissionSchema.safeParse(input);
@@ -60,7 +47,6 @@ const publicView=()=>({count:records(config.kind).length,rows:[]});
     const data=parsed.data;
     rateLimit(db,`ip:${identity}`);
     if(data.email)rateLimit(db,`recipient:${data.email}`,3);
-    if(data.second_email)rateLimit(db,`recipient:${data.second_email}`,3);
     const result=atomic(()=>onSubmit(data));
     await flush();
     let message=result.message || config.success;
@@ -71,25 +57,9 @@ const publicView=()=>({count:records(config.kind).length,rows:[]});
     }
     return {ok:true,message,id:result.id || null};
   }
-  async function action(input) {
-    const result=atomic(()=>onAction(input));await flush();return result;
-  }
-  function access(raw) {
-    const grant=inspectToken(raw);
-    if(!grant || !grant.record)throw new AppError('This link is invalid, expired, or already used.',410);
-    return {action:grant.action, title:config.title, token:raw, description:accessDescription(grant), recordId:grant.record_id};
-  }
-  async function redeem(raw, decision) {
-    const result=atomic(()=>{
-      const grant=inspectToken(raw);
-      if(!grant || !grant.record)throw new AppError('This link is invalid, expired, or already used.',410);
-      const value=onRedeem(grant,decision);consume(raw);return value;
-    });
-    await flush();return result;
-  }
-  function adminView() {return {records:records(config.kind),outbox:db.prepare('SELECT id,status,error,created_at FROM outbox ORDER BY created_at DESC LIMIT 30').all(),extra:adminExtra()};}
+  function adminView() {return {records:records(config.kind),outbox:db.prepare('SELECT id,status,error,created_at FROM outbox ORDER BY created_at DESC LIMIT 30').all()};}
   function retryFailed() {db.prepare("UPDATE outbox SET status='pending',error=NULL WHERE status='failed'").run();return flush();}
-  return {store,submit,action,access,redeem,publicView,adminView,flush,retryFailed};
+  return {store,submit,adminView,flush,retryFailed};
 }
 let singleton;
 export function service() {return singleton ||= createService();}
